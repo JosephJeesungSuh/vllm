@@ -226,32 +226,37 @@ def _lora_expand(
         MAX_LORAS,
     )
 
+    import os
+    if os.environ.get("DEBUG_LORA", "0") == "1":
+        from remote_pdb import RemotePdb
+        RemotePdb('0.0.0.0', 4444).set_trace()   
+
     _lora_expand_kernel[grid](
-        inputs,
-        lora_ptr_tensor,
-        output_tensor,
-        M,
-        MAX_N,
-        K,
-        token_indices_sorted_by_lora_ids,
-        num_tokens_per_lora,
-        lora_token_start_loc,
-        lora_ids,
-        slice_start_tensor,
-        inputs.stride(0),
-        inputs.stride(1),
-        inputs.stride(2),
-        lora_strides_d0_tensor,
-        lora_strides_d1_tensor,
-        lora_strides_d2_tensor,
-        output_tensor.stride(0),
-        output_tensor.stride(1),
-        hidden_sizes_tensor,
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        EVEN_K,
-        ADD_INPUTS,
+        inputs, # [3, 8192, 16]
+        lora_ptr_tensor, # [3]
+        output_tensor, # [8192, 12288]
+        M, # 8192
+        MAX_N, # 4096
+        K, # 16
+        token_indices_sorted_by_lora_ids, # [0, 1, ..., 8191]
+        num_tokens_per_lora, # [8192, 0]
+        lora_token_start_loc, # [8, 8192, 0]
+        lora_ids, # [0, -1]
+        slice_start_tensor,  # [0, 4096, 8192]
+        inputs.stride(0), # 131072
+        inputs.stride(1), # 16
+        inputs.stride(2), # 1
+        lora_strides_d0_tensor, # 65536
+        lora_strides_d1_tensor, # 16
+        lora_strides_d2_tensor, # 1
+        output_tensor.stride(0), # 12288
+        output_tensor.stride(1), # 1
+        hidden_sizes_tensor, # 4096
+        BLOCK_M, # 64
+        BLOCK_N, # 128
+        BLOCK_K, # 16
+        EVEN_K, # True
+        ADD_INPUTS, # True
         CAST_TYPE,
         NUM_SLICES,
         same_stride,

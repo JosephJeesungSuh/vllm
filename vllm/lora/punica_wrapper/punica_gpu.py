@@ -16,7 +16,7 @@ from vllm.triton_utils import HAS_TRITON
 
 if HAS_TRITON:
     from vllm.lora.ops.triton_ops import (LoRAKernelMeta, lora_expand,
-                                          lora_shrink)
+                                          lora_shrink, lora_shrink_expand_fused)
 
 from .punica_base import PunicaWrapperBase
 
@@ -66,7 +66,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         self.is_prefill = mapping.is_prefill
         self._update_base_metadata(mapping, lora_index_to_id, max_loras,
-                                   vocab_size, extra_vocab_size,
+                                    vocab_size, extra_vocab_size,
                                    long_lora_context)
 
         # Prepare cuda kernel metadata tensors
@@ -91,11 +91,22 @@ class PunicaWrapperGPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
+
+        # # debugger
+        # from remote_pdb import RemotePdb
+        # RemotePdb('0.0.0.0', 4444).set_trace()   
+
         lora_shrink(
-            x,
-            lora_a_stacked,
-            y,
-            *self.token_mapping_meta.meta_args(x.size(0)),
+            x, # shape = [8192, 4096]
+            lora_a_stacked, # length 3 tuple of each shape = [1, 1, 16, 4096]
+            y, # shape = [3, 8192, 16]
+            *self.token_mapping_meta.meta_args(x.size(0)), # length 6 tuple
+            # first element: shape = [4096], all zeros
+            # second element: shape = [8192], [0, 1, 2, ..., 8191]
+            # third element: shape = [2], [8192, 0]
+            # fourth element: shape = [3], [0, 8192, 0]
+            # fifth element: shape = [2], [0, -1]
+            # sixth element: shape = [1], [False]
             scale,
         )
 
@@ -169,14 +180,16 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
-        lora_expand(
-            x.unsqueeze(dim=0),
-            (lora_b_stacked, ),
-            y,
-            *self.token_mapping_meta.meta_args(x.size(0)),
-            offset_start=0,
-            add_inputs=add_inputs,
-        )
+        # lora_expand(
+        #     x.unsqueeze(dim=0),
+        #     (lora_b_stacked, ),
+        #     y,
+        #     *self.token_mapping_meta.meta_args(x.size(0)),
+        #     offset_start=0,
+        #     add_inputs=add_inputs,
+        # )
+        y = y
+        return
 
     def add_lora_linear(self,
                         y: torch.Tensor,
@@ -194,7 +207,7 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         Semantics:
             for i in range(len(lora_a_stacked)):
-                y[i] += (
+                y[i] += ( 
                     x[i].unsqueeze(0)
                     @ lora_a_stacked[indices[i], layer_idx, :, :]
                     @ lora_b_stacked[indices[i], layer_idx, :, :]
@@ -211,6 +224,15 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             output_slices (Tuple[int, ...]): Every slice's size.
             buffer (Optional[torch.Tensor]): Defaults to None.
         """
+
+        # y shape = [8192, 12288]
+        # x shape = [8192, 4096]
+        # lora_a_stacked: length 3 tuple of each shape = [1, 1, 16, 4096]
+        # lora_b_stacked: length 3 tuple of each shape = [1, 1, 4096, 16]
+        # lora_bias_stacked: None, currently
+        # output_slices: list of 3 elements, each element is 4096
+        # from remote_pdb import RemotePdb
+        # RemotePdb('0.0.0.0', 4444).set_trace()   
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
         if lora_bias_stacked is not None:
@@ -229,12 +251,37 @@ class PunicaWrapperGPU(PunicaWrapperBase):
                 dtype=torch.float32,
                 device=x.device,
             )
+
+        # IMPLEMENTATION OF FUSE EXPAND AND SHRINK
+        ################################################
+        import os
+        if os.environ.get("FUSE_EXPERIMENTAL", "0") == "1":
+            self.add_shrink_expand(
+                x,
+                y,
+                lora_a_stacked,
+                scale,
+                lora_b_stacked,
+                None,
+                output_slices,
+                add_inputs=True,
+                **kwargs,
+            )
+            return
+        ################################################
+        # IMPLEMENTATION OF FUSE EXPAND AND SHRINK
+
         self.add_shrink(
             buffer,  # type: ignore
             x,
             lora_a_stacked,
             scale,
             **kwargs)
+        
+        # if os.environ.get("DEBUG_LORA", "0") == "1":
+        #     from remote_pdb import RemotePdb
+        #     RemotePdb('0.0.0.0', 4444).set_trace()   
+
         self.add_expand(
             y,
             buffer,  # type: ignore
@@ -243,6 +290,47 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             output_slices,
             add_inputs=True,
             **kwargs)
+
+    def add_shrink_expand(self,
+                          x: torch.Tensor,
+                          y: torch.Tensor,
+                          lora_a_stacked: Tuple[torch.Tensor, ...],
+                          scale: float,
+                          lora_b_stacked: Tuple[torch.Tensor, ...],
+                          lora_bias_stacked: Optional[Tuple[torch.Tensor, ...]],
+                          output_slices: Tuple[int, ...],
+                          offset_start: int = 0,
+                          add_inputs=True,
+                          **kwargs) -> None:
+        """
+        Semantics:
+            for i in range(len(lora_b_stacked)):
+                slice = output_slices[i]
+                y[:, offset:offset+slice] += (x @ lora_a_stacked[i]) * scale 
+                @ lora_b_stacked[i] + lora_bias_stacked[i]
+                offset += slice                
+        """
+        y_org = y
+        x = x.view(-1, x.shape[-1])
+        y = y.view(-1, y.shape[-1])
+        if lora_bias_stacked is not None:
+            token_lora_indices = torch.narrow(
+                self._token_lora_indices, 0, 0, y.size(0)
+            )
+            self._apply_bias(
+                token_lora_indices, y, output_slices, lora_bias_stacked
+            )
+        lora_shrink_expand_fused(
+            x,
+            lora_a_stacked,
+            scale,
+            lora_b_stacked,
+            y,
+            *self.token_mapping_meta.meta_args(x.size(0)),
+            offset_start=offset_start,
+            add_inputs=True,
+        )
+        y = y.view_as(y_org)
 
     def add_lora_logits(self,
                         y: torch.Tensor,

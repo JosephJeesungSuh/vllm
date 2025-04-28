@@ -28,13 +28,51 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
                         BLOCK_K: tl.constexpr, EVEN_K: tl.constexpr,
                         SPLIT_K: tl.constexpr, SLICE_NUM: tl.constexpr):
 
-    cta_n_num = tl.cdiv(N, BLOCK_N)
-    cta_m_num = tl.cdiv(M, BLOCK_M)
+    # _lora_shrink_kernel[grid](
+    #     inputs, # shape = [8192, 4096]
+    #     lora_ptr_tensor, # shape = [3, 1, 1, 16, 4096]
+    #     output_tensor, # shape = [3, 8192, 16]
+    #     M, # M = inputs.size(0) = num_tokens = 8192
+    #     N, # N = lora_a_weights[0].shape[-2] = max_rank = 16
+    #     K, # K = lora_a_weights[0].shape[-1] = hidden_size = 4096
+    #     token_indices_sorted_by_lora_ids, # [0, 1, 2, ...]
+    #     num_tokens_per_lora, # [8192, 0]
+    #     lora_token_start_loc, # [0, 8192, 0]
+    #     lora_ids, # [0, -1]
+    #     scaling, # 1.0
+    #     inputs.stride(0), # 4096
+    #     inputs.stride(1), # 1
+    #     lora_strides_d0, # 65536 = 16 * 4096
+    #     lora_strides_d1, # 4096
+    #     lora_strides_d2, # 1
+    #     output_tensor.stride(0), # 131072 = 8192 * 16
+    #     output_tensor.stride(1), # 16
+    #     output_tensor.stride(2), # 1
+    #     BLOCK_M, # 32 currently
+    #     BLOCK_N, # 16 currently
+    #     BLOCK_K, # 256 if M < 128 else 32 (currently 32)
+    #     EVEN_K, # True
+    #     SPLIT_K, # 8
+    #     NUM_SLICES, # 3 
+    #     num_warps=NUM_WARPS, # 4
+    #     num_ctas=NUM_CTAS, # 1
+    #     num_stages=NUM_STAGES, # 2
+    #     maxnreg=MAX_NREG, # None
+    # )
+
+    cta_n_num = tl.cdiv(N, BLOCK_N) # 16 / 16 = 1
+    cta_m_num = tl.cdiv(M, BLOCK_M) # 8192 / 32 = 256
+    # note that each point in grid corresponds to the thread block.
+    # grid = (SPLIT_K * cta_m_num * cta_n_num, NUM_SLICES, MAX_LORAS)
+    # (MAX_LORAS includes the no-lora case, which is -1)
+    # each lora gets its own set of thread blocks.
 
     pid_sk_m_n = tl.program_id(axis=0)
     pid_sk = pid_sk_m_n % SPLIT_K
     pid_m = (pid_sk_m_n // SPLIT_K) % cta_m_num
     pid_n = pid_sk_m_n // (SPLIT_K * cta_m_num) % cta_n_num
+    # pid_sk_m_n = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+
 
     slice_id = tl.program_id(axis=1)
     lora_idx = tl.program_id(axis=2)
@@ -42,11 +80,13 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
     lora_id = tl.load(lora_ids + lora_idx)
     if lora_id == -1:
         # Early exit for the no-lora case.
+        # lora_ids is a list of lora_ids, -1 with no loda.
         return
 
     lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
 
     cta_m_offset = pid_m * BLOCK_M
+    # M index is about the number of tokens.
     if cta_m_offset >= lora_m_size:
         # Early exit CTA.
         return
@@ -156,7 +196,7 @@ def _lora_shrink(
 
     (lora_ptr_tensor, lora_strides_d0, lora_strides_d1,
      lora_strides_d2) = _get_lora_a_ptr(lora_a_weights, inputs.device)
-    N, K = lora_a_weights[0].shape[-2:]  # K=hidden_size,N=rank
+    N, K = lora_a_weights[0].shape[-2:]  # K=hidden_size, N=rank
     NUM_SLICES = len(lora_a_weights)
     MAX_LORAS = lora_ids.size(0)
 
@@ -184,36 +224,50 @@ def _lora_shrink(
         MAX_LORAS,
     )
 
+    # debugger
+    # from remote_pdb import RemotePdb
+    # RemotePdb('0.0.0.0', 4444).set_trace()  
+    # inputs.shape = [8192, 4096]
+    # lora_a_weights: length of 3, each shape [1, 1, 16, 4096]
+    # output_tensor.shape = [3, 8192, 16]
+    # token_lora_mapping.shape = [8192], all zeros currently
+    # token_indices_sorted_by_lora_ids.shape = [8192], currently [0, 1, 2, ...]
+    # num_tokens_per_lora.shape = [2], currently [8192, 0]
+    # lora_token_start_loc.shape = [3], currently [0, 8192, 0]
+    # lora_ids.shape = [2], currently [0, -1]
+    # no_lora_flag_cpu.shape = [1], currently [Flase]
+    # grid = (2048, 3, 2)
+
     _lora_shrink_kernel[grid](
-        inputs,
-        lora_ptr_tensor,
-        output_tensor,
-        M,
-        N,
-        K,
-        token_indices_sorted_by_lora_ids,
-        num_tokens_per_lora,
-        lora_token_start_loc,
-        lora_ids,
-        scaling,
-        inputs.stride(0),
-        inputs.stride(1),
-        lora_strides_d0,
-        lora_strides_d1,
-        lora_strides_d2,
-        output_tensor.stride(0),
-        output_tensor.stride(1),
-        output_tensor.stride(2),
-        BLOCK_M,
-        BLOCK_N,
-        BLOCK_K,
-        EVEN_K,
-        SPLIT_K,
-        NUM_SLICES,
-        num_warps=NUM_WARPS,
-        num_ctas=NUM_CTAS,
-        num_stages=NUM_STAGES,
-        maxnreg=MAX_NREG,
+        inputs, # shape = [8192, 4096]
+        lora_ptr_tensor, # shape = [3, 1, 1, 16, 4096]
+        output_tensor, # shape = [3, 8192, 16]
+        M, # M = inputs.size(0) = num_tokens = 8192
+        N, # N = lora_a_weights[0].shape[-2] = max_rank = 16
+        K, # K = lora_a_weights[0].shape[-1] = hidden_size = 4096
+        token_indices_sorted_by_lora_ids, # [0, 1, 2, ...]
+        num_tokens_per_lora, # [8192, 0]
+        lora_token_start_loc, # [0, 8192, 0]
+        lora_ids, # [0, -1]
+        scaling, # 1.0
+        inputs.stride(0), # 4096
+        inputs.stride(1), # 1
+        lora_strides_d0, # 65536 = 16 * 4096
+        lora_strides_d1, # 4096
+        lora_strides_d2, # 1
+        output_tensor.stride(0), # 131072 = 8192 * 16
+        output_tensor.stride(1), # 16
+        output_tensor.stride(2), # 1
+        BLOCK_M, # 32 currently
+        BLOCK_N, # 16 currently
+        BLOCK_K, # 256 if M < 128 else 32 (currently 32)
+        EVEN_K, # True
+        SPLIT_K, # 8
+        NUM_SLICES, # 3 
+        num_warps=NUM_WARPS, # 4
+        num_ctas=NUM_CTAS, # 1
+        num_stages=NUM_STAGES, # 2
+        maxnreg=MAX_NREG, # None
     )
 
     return
