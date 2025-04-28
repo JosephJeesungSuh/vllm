@@ -228,6 +228,17 @@ def do_shrink_kernel(
     accumulator = mm_k(a_ptr, b_ptr, input_d1_stride, lora_d2_stride, offset_k,
                        K, BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, SPLIT_K, False,
                        cur_lora_ptr.dtype.element_ty)
+    # a_ptr : shape = [32,32]
+    # b_ptr : shape = [32,16]
+    # input_d1_stride : 1
+    # lora_d2_stride : 1
+    # offset_k : shape = [32]
+    # K : 4096
+    # BLOCK_M : 32
+    # BLOCK_N : 16
+    # BLOCK_K : 32
+    # EVEN_K : 1
+    # SPLIT_K : 8
 
     # Identify the C output pointers to store the results of the accumulator.
     offset_cn = tl.arange(0, BLOCK_N) + pid_n * BLOCK_N

@@ -92,10 +92,6 @@ class PunicaWrapperGPU(PunicaWrapperBase):
 
         x = x.view(-1, x.shape[-1])
 
-        # # debugger
-        # from remote_pdb import RemotePdb
-        # RemotePdb('0.0.0.0', 4444).set_trace()   
-
         lora_shrink(
             x, # shape = [8192, 4096]
             lora_a_stacked, # length 3 tuple of each shape = [1, 1, 16, 4096]
@@ -278,9 +274,10 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             scale,
             **kwargs)
         
+        # import os
         # if os.environ.get("DEBUG_LORA", "0") == "1":
         #     from remote_pdb import RemotePdb
-        #     RemotePdb('0.0.0.0', 4444).set_trace()   
+        #     RemotePdb('0.0.0.0', 5555).set_trace()   
 
         self.add_expand(
             y,

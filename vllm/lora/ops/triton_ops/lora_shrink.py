@@ -30,7 +30,7 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
 
     # _lora_shrink_kernel[grid](
     #     inputs, # shape = [8192, 4096]
-    #     lora_ptr_tensor, # shape = [3, 1, 1, 16, 4096]
+    #     lora_ptr_tensor, # shape = [3]
     #     output_tensor, # shape = [3, 8192, 16]
     #     M, # M = inputs.size(0) = num_tokens = 8192
     #     N, # N = lora_a_weights[0].shape[-2] = max_rank = 16
@@ -60,19 +60,13 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
     #     maxnreg=MAX_NREG, # None
     # )
 
-    cta_n_num = tl.cdiv(N, BLOCK_N) # 16 / 16 = 1
-    cta_m_num = tl.cdiv(M, BLOCK_M) # 8192 / 32 = 256
-    # note that each point in grid corresponds to the thread block.
-    # grid = (SPLIT_K * cta_m_num * cta_n_num, NUM_SLICES, MAX_LORAS)
-    # (MAX_LORAS includes the no-lora case, which is -1)
-    # each lora gets its own set of thread blocks.
+    cta_n_num = tl.cdiv(N, BLOCK_N)
+    cta_m_num = tl.cdiv(M, BLOCK_M)
 
     pid_sk_m_n = tl.program_id(axis=0)
     pid_sk = pid_sk_m_n % SPLIT_K
     pid_m = (pid_sk_m_n // SPLIT_K) % cta_m_num
     pid_n = pid_sk_m_n // (SPLIT_K * cta_m_num) % cta_n_num
-    # pid_sk_m_n = SPLIT_K * triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
-
 
     slice_id = tl.program_id(axis=1)
     lora_idx = tl.program_id(axis=2)
@@ -80,13 +74,11 @@ def _lora_shrink_kernel(input_ptr, lora_ptr, out_ptr, M, N, K,
     lora_id = tl.load(lora_ids + lora_idx)
     if lora_id == -1:
         # Early exit for the no-lora case.
-        # lora_ids is a list of lora_ids, -1 with no loda.
         return
 
     lora_m_size = tl.load(num_tokens_per_lora + lora_idx)
 
     cta_m_offset = pid_m * BLOCK_M
-    # M index is about the number of tokens.
     if cta_m_offset >= lora_m_size:
         # Early exit CTA.
         return
@@ -196,7 +188,7 @@ def _lora_shrink(
 
     (lora_ptr_tensor, lora_strides_d0, lora_strides_d1,
      lora_strides_d2) = _get_lora_a_ptr(lora_a_weights, inputs.device)
-    N, K = lora_a_weights[0].shape[-2:]  # K=hidden_size, N=rank
+    N, K = lora_a_weights[0].shape[-2:]  # K=hidden_size,N=rank
     NUM_SLICES = len(lora_a_weights)
     MAX_LORAS = lora_ids.size(0)
 
@@ -240,7 +232,7 @@ def _lora_shrink(
 
     _lora_shrink_kernel[grid](
         inputs, # shape = [8192, 4096]
-        lora_ptr_tensor, # shape = [3, 1, 1, 16, 4096]
+        lora_ptr_tensor, # shape = [3]
         output_tensor, # shape = [3, 8192, 16]
         M, # M = inputs.size(0) = num_tokens = 8192
         N, # N = lora_a_weights[0].shape[-2] = max_rank = 16

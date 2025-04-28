@@ -60,8 +60,8 @@ if __name__ == "__main__":
     )
     sampling_params, llm = get_vllm_engine(args)
     lora_request = LoRARequest(
-        # "lora1", 1, lora_path="yard1/llama-2-7b-sql-lora-test"
-        "lora1", 1, lora_path="jjssuh/llama-2-7b-subpop"
+        "lora1", 1, lora_path="yard1/llama-2-7b-sql-lora-test"
+        # "lora1", 1, lora_path="jjssuh/llama-2-7b-subpop"
     )
     print(f"--> get_vllm_engine(): LLM engine initialized.")
 
