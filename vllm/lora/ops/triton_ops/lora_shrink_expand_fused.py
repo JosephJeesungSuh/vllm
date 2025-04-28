@@ -29,7 +29,7 @@ def _lora_shrink_expand_kernel(
     y_ptr,                 # [M, hidden_total]                             FP16/BF16
     # Scalars / sizes ---------------------------------------------------------
     M: tl.constexpr,       # number of tokens (rows)
-    RANK: tl.constexpr,    # LoRA rank == BLOCK_N (compile‑time)
+    N: tl.constexpr,    # LoRA rank == BLOCK_N (compile‑time)
     K_sz,                  # hidden size of X (runtime)
     N_hidden_max,          # max hidden size across slices (runtime)
     # Mapping tensors ---------------------------------------------------------
@@ -61,12 +61,14 @@ def _lora_shrink_expand_kernel(
     matches vLLM's existing shrink kernel where `BLOCK_N` is the rank.
     """
 
-    cta_mn = tl.program_id(axis=0)
+    cta_mnk = tl.program_id(axis=0)
     cta_m_num = tl.cdiv(M, BLOCK_M) # number of CTAs in M (token) dimension
-    cta_n_num = tl.cdiv(N_hidden_max, BLOCK_N) # number of CTAs in N (hidden dimension) dimension
+    cta_n_num = tl.cdiv(N, BLOCK_N) # number of CTAs in N (lora rank) dimension
+    cta_k_num = tl.cdiv(K_sz, BLOCK_K) # number of CTAs in K (hidden) dimension
 
-    pid_m = cta_mn % cta_m_num
-    pid_n = (cta_mn // cta_m_num) % cta_n_num
+    pid_k = cta_mnk % cta_k_num
+    pid_m = (cta_mnk // cta_k_num) % cta_m_num
+    pid_n = (cta_mnk // (cta_k_num * cta_m_num)) % cta_n_num
 
     slice_id = tl.program_id(axis=1)
     lora_idx = tl.program_id(axis=2)
@@ -101,34 +103,75 @@ def _lora_shrink_expand_kernel(
     # ------------------------------------------------------------------
     # Phase 1 – Shrink:   S = X @ Aᵀ   (⟂ register tile)
     # ------------------------------------------------------------------
-    S_reg = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
+    # S_reg = tl.zeros((BLOCK_M, RANK), dtype=tl.float32)
 
-    num_k_tiles = tl.cdiv(K_sz, BLOCK_K)
-    for k_tile in range(0, num_k_tiles):
-        k_off = k_tile * BLOCK_K
-        k_mask = tl.arange(0, BLOCK_K) < (K_sz - k_off)
+    # num_k_tiles = tl.cdiv(K_sz, BLOCK_K)
+    # for k_tile in range(0, num_k_tiles):
+    #     k_off = k_tile * BLOCK_K
+    #     k_mask = tl.arange(0, BLOCK_K) < (K_sz - k_off)
 
-        x_ptr_tile = (
-            x_ptr
-            + ram[:, None] * x_s0 # ram loaded which token indices this CTA will process. x_s0 is stride(0)
-            + (k_off + tl.arange(0, BLOCK_K))[None, :] * x_s1 # load BLOCK_K hidden dimension
-        )
+    #     x_ptr_tile = (
+    #         x_ptr
+    #         + ram[:, None] * x_s0 # ram loaded which token indices this CTA will process. x_s0 is stride(0)
+    #         + (k_off + tl.arange(0, BLOCK_K))[None, :] * x_s1 # load BLOCK_K hidden dimension
+    #     )
 
-        a_ptr_tile = (
-            la_base + la_s0 * lora_idx
-            + tl.arange(0, RANK)[:, None] * la_s1
-            + (k_off + tl.arange(0, BLOCK_K))[None, :] * la_s2
-        )
+    #     a_ptr_tile = (
+    #         la_base + la_s0 * lora_idx
+    #         + tl.arange(0, RANK)[:, None] * la_s1
+    #         + (k_off + tl.arange(0, BLOCK_K))[None, :] * la_s2
+    #     )
 
-        from remote_pdb import RemotePdb
-        RemotePdb('0.0.0.0', 4444).set_trace() 
+    #     from remote_pdb import RemotePdb
+    #     RemotePdb('0.0.0.0', 4444).set_trace() 
 
-        x_tile = tl.load(x_ptr_tile, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
-        a_tile = tl.load(a_ptr_tile, mask=(tl.arange(0, RANK)[:, None] < RANK) & k_mask[None, :], other=0.0)
+    #     x_tile = tl.load(x_ptr_tile, mask=row_mask[:, None] & k_mask[None, :], other=0.0)
+    #     a_tile = tl.load(a_ptr_tile, mask=(tl.arange(0, RANK)[:, None] < RANK) & k_mask[None, :], other=0.0)
 
-        S_reg += tl.dot(x_tile, tl.trans(a_tile))  # (BM × RANK)
+    #     S_reg += tl.dot(x_tile, tl.trans(a_tile))  # (BM × RANK)
 
+    # S_reg *= SCALE
+
+    offset_n = tl.arange(0, BLOCK_N)  # RANK dimension
+    rbn = tl.max_contiguous(offset_n, BLOCK_N)
+
+    offset_k_vec = tl.arange(0, BLOCK_K)
+
+    # Build A and X block pointers (matches _lora_shrink_kernel layout)
+    a_ptr = (
+        la_base + la_s0 * lora_idx
+        + rbn[None, :] * la_s1
+        + offset_k_vec[:, None] * la_s2
+    )  # shape (BLOCK_K, BLOCK_N)
+
+    S_reg = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    from remote_pdb import RemotePdb
+    RemotePdb('0.0.0.0', 4444).set_trace() 
+
+    # Iterate over K dimension using mm_k --------------------------------
+    SPLIT_K = 1  # fused kernel never splits K
+    accumulator = mm_k(
+        # a_ptr (X) -------------------------------------------------------
+        x_ptr + ram[:, None] * x_s0,
+        # b_ptr (A) -------------------------------------------------------
+        a_ptr,
+        x_s1,
+        la_s2,
+        offset_k_vec,
+        K_sz,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        EVEN_K,
+        SPLIT_K,
+        False,
+        tl.float16,
+    )
+
+    S_reg += accumulator
     S_reg *= SCALE
+
 
     # ------------------------------------------------------------------
     # Phase 2 – Expand:   Y += S_reg @ B
@@ -215,9 +258,9 @@ def _lora_shrink_expand_fused(
     assert lora_ids.size(0) + 1 == lora_token_start_loc.size(0)
 
     # Triton kernel configs
-    BLOCK_M = 64
-    BLOCK_N = 16
-    BLOCK_K = 32
+    BLOCK_M = 64 # num tokens
+    BLOCK_N = 16 # related to lora rank
+    BLOCK_K = 128 # breaking up hidden size
     EVEN_K = K % BLOCK_K == 0
     NUM_WARPS = 4
     NUM_CTAS = 1
@@ -232,7 +275,7 @@ def _lora_shrink_expand_fused(
         CAST_TYPE = True
 
     grid = (
-        triton.cdiv(M, BLOCK_M) * triton.cdiv(MAX_N, BLOCK_N),
+        triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N) * triton.cdiv(K, BLOCK_K),
         NUM_SLICES,
         MAX_LORAS,
     )

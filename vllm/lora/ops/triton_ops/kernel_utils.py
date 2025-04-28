@@ -221,6 +221,9 @@ def do_shrink_kernel(
              rbn[None, :] * lora_d1_stride +
              offset_k[:, None] * lora_d2_stride)
 
+    from remote_pdb import RemotePdb
+    RemotePdb('0.0.0.0', 5555).set_trace()
+
     # Compute partial/complete block matrix product.
     accumulator = mm_k(a_ptr, b_ptr, input_d1_stride, lora_d2_stride, offset_k,
                        K, BLOCK_M, BLOCK_N, BLOCK_K, EVEN_K, SPLIT_K, False,
