@@ -176,14 +176,14 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             add_inputs (bool): Default to True.
         """
 
-        # lora_expand(
-        #     x.unsqueeze(dim=0),
-        #     (lora_b_stacked, ),
-        #     y,
-        #     *self.token_mapping_meta.meta_args(x.size(0)),
-        #     offset_start=0,
-        #     add_inputs=add_inputs,
-        # )
+        lora_expand(
+            x.unsqueeze(dim=0),
+            (lora_b_stacked, ),
+            y,
+            *self.token_mapping_meta.meta_args(x.size(0)),
+            offset_start=0,
+            add_inputs=add_inputs,
+        )
         y = y
         return
 
@@ -287,6 +287,9 @@ class PunicaWrapperGPU(PunicaWrapperBase):
             output_slices,
             add_inputs=True,
             **kwargs)
+        
+        # from remote_pdb import RemotePdb
+        # RemotePdb('0.0.0.0', 5555).set_trace()
 
     def add_shrink_expand(self,
                           x: torch.Tensor,

@@ -22,7 +22,7 @@ def get_vllm_engine(args: argparse.Namespace) -> Tuple[SamplingParams, LLM]:
     """
     sampling_params = SamplingParams(
         max_tokens=256,
-        temperature=1.0,
+        temperature=0.0,
         logprobs=1,
     )
     try:
@@ -38,6 +38,7 @@ def get_vllm_engine(args: argparse.Namespace) -> Tuple[SamplingParams, LLM]:
             gpu_memory_utilization=args.gpu_memory_utilization,
             # distributed_executor_backend="mp",
             enable_lora=True,
+            max_lora_rank=64,
         )
     except:
         raise NotImplementedError()
@@ -68,8 +69,9 @@ if __name__ == "__main__":
     prompts = ["Hello, how are you doing today?", "What is the capital of France?", "Can you tell me a joke?", "What is the weather like today?"]
     output = llm.generate(prompts, sampling_params, lora_request=lora_request)
 
-    import pdb; pdb.set_trace()
-
+    for i, prompt in enumerate(prompts):
+        print(f"Prompt: {prompt}")
+        print(f"Output: {output[i].outputs[0].text}")
 
 
 

@@ -226,10 +226,10 @@ def _lora_expand(
         MAX_LORAS,
     )
 
-    import os
-    if os.environ.get("DEBUG_LORA", "0") == "1":
-        from remote_pdb import RemotePdb
-        RemotePdb('0.0.0.0', 4444).set_trace()   
+    # import os
+    # if os.environ.get("DEBUG_LORA", "0") == "1":
+    #     from remote_pdb import RemotePdb
+    #     RemotePdb('0.0.0.0', 4444).set_trace()   
 
     _lora_expand_kernel[grid](
         inputs, # [3, 8192, 16]
